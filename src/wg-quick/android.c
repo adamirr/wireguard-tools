@@ -1110,7 +1110,38 @@ static void cmd_up_cleanup(void)
 	free(cleanup_iface);
 }
 
-static void cmd_up(const char *iface, const char *config, unsigned int mtu, const char *addrs, const char *dnses, const char *excluded_applications, const char *included_applications)
+static void run_hooks(const char *cmds, const char *iface)
+{
+	if (cmds == NULL)
+		return;
+	size_t len = strlen(cmds), iface_len = strlen(iface), j = 0, iface_count = 0;
+	if (len > (1<<16))
+		return;
+	for (size_t i = 0; i < len - 1; ++i) {
+		if (cmds[i] == '%' && cmds[++i] == 'i') {
+			iface_count++;
+		}
+	}
+
+	_cleanup_free_ char *current_cmd = xmalloc(len + ((iface_len - 2) * iface_count) + 1);
+
+	for (size_t i = 0; i < len; ++i) {
+		if (cmds[i] != '\n') {
+			if (cmds[i] == '%' && cmds[++i] == 'i') {
+				strcpy(current_cmd + j, iface);
+				j += iface_len;
+			} else {
+				current_cmd[j++] = cmds[i];
+			}
+		} else if (j != 0) {
+			current_cmd[j] = '\0';
+			j = 0;
+			cmd("%s", current_cmd);
+		}
+	}
+}
+
+static void cmd_up(const char *iface, const char *config, unsigned int mtu, const char *addrs, const char *dnses, const char *excluded_applications, const char *included_applications, const char *pre_up_cmds, const char *post_up_cmds)
 {
 	DEFINE_CMD(c);
 	unsigned int netid = 0;
@@ -1127,7 +1158,9 @@ static void cmd_up(const char *iface, const char *config, unsigned int mtu, cons
 	add_if(iface);
 	set_config(iface, config);
 	listen_port = determine_listen_port(iface);
+	run_hooks(pre_up_cmds, iface);
 	up_if(&netid, iface, listen_port);
+	run_hooks(post_up_cmds, iface);
 	set_addr(iface, addrs);
 	set_dnses(netid, dnses);
 	set_routes(iface, netid);
@@ -1140,7 +1173,7 @@ static void cmd_up(const char *iface, const char *config, unsigned int mtu, cons
 	exit(EXIT_SUCCESS);
 }
 
-static void cmd_down(const char *iface)
+static void cmd_down(const char *iface, char *pre_down_cmds, char *post_down_cmds)
 {
 	DEFINE_CMD(c);
 	bool found = false;
@@ -1159,12 +1192,32 @@ static void cmd_down(const char *iface)
 		exit(EMEDIUMTYPE);
 	}
 
+	run_hooks(pre_down_cmds, iface);
 	del_if(iface);
+	run_hooks(post_down_cmds, iface);
 	broadcast_change();
 	exit(EXIT_SUCCESS);
 }
 
-static void parse_options(char **iface, char **config, unsigned int *mtu, char **addrs, char **dnses, char **excluded_applications, char **included_applications, const char *arg)
+static void clean_hook_cmd(const char *line, const size_t len, char *output)
+{
+    size_t j = 0;
+    bool found_prefix = false;
+    bool found_cmd_start = false;
+    for (size_t i = 0; i < len; ++i) {
+        if (!found_cmd_start && isspace(line[i]))
+            continue;
+        if (found_prefix && !isspace(line[i]))
+            found_cmd_start = true;
+        if (line[i] == '=')
+            found_prefix = true;
+
+        output[j++] = line[i];
+    }
+    output[j] = '\0';
+}
+
+static void parse_options(char **iface, char **config, unsigned int *mtu, char **addrs, char **dnses, char **excluded_applications, char **included_applications, char **pre_up_cmds, char **post_up_cmds, char **pre_down_cmds, char **post_down_cmds, const char *arg)
 {
 	_cleanup_fclose_ FILE *file = NULL;
 	_cleanup_free_ char *line = NULL;
@@ -1254,6 +1307,22 @@ static void parse_options(char **iface, char **config, unsigned int *mtu, char *
 			} else if (!strncasecmp(clean, "MTU=", 4) && j > 4) {
 				*mtu = atoi(clean + 4);
 				continue;
+			} else if (!strncasecmp(clean, "PreUp=", 6) && j > 4) {
+				clean_hook_cmd(line, len, clean);
+				*pre_up_cmds = concat_and_free(*pre_up_cmds, "\n", clean + 6);
+				continue;
+			} else if (!strncasecmp(clean, "PostUp=", 7) && j > 4) {
+				clean_hook_cmd(line, len, clean);
+				*post_up_cmds = concat_and_free(*post_up_cmds, "\n", clean + 7);
+				continue;
+			} else if (!strncasecmp(clean, "PreDown=", 8) && j > 4) {
+				clean_hook_cmd(line, len, clean);
+				*pre_down_cmds = concat_and_free(*pre_down_cmds, "\n", clean + 8);
+				continue;
+			} else if (!strncasecmp(clean, "PostDown=", 9) && j > 4) {
+				clean_hook_cmd(line, len, clean);
+				*post_down_cmds = concat_and_free(*post_down_cmds, "\n", clean + 9);
+				continue;
 			}
 		}
 		*config = concat_and_free(*config, "", line);
@@ -1278,17 +1347,21 @@ int main(int argc, char *argv[])
 	_cleanup_free_ char *excluded_applications = NULL;
 	_cleanup_free_ char *included_applications = NULL;
 	unsigned int mtu;
+	_cleanup_free_ char *pre_up_cmds = NULL;
+	_cleanup_free_ char *post_up_cmds = NULL;
+	_cleanup_free_ char *pre_down_cmds = NULL;
+	_cleanup_free_ char *post_down_cmds = NULL;
 
 	if (argc == 2 && (!strcmp(argv[1], "help") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")))
 		cmd_usage(argv[0]);
 	else if (argc == 3 && !strcmp(argv[1], "up")) {
 		auto_su(argc, argv);
-		parse_options(&iface, &config, &mtu, &addrs, &dnses, &excluded_applications, &included_applications, argv[2]);
-		cmd_up(iface, config, mtu, addrs, dnses, excluded_applications, included_applications);
+		parse_options(&iface, &config, &mtu, &addrs, &dnses, &excluded_applications, &included_applications, &pre_up_cmds, &post_up_cmds, &pre_down_cmds, &post_down_cmds, argv[2]);
+		cmd_up(iface, config, mtu, addrs, dnses, excluded_applications, included_applications, pre_up_cmds, post_up_cmds);
 	} else if (argc == 3 && !strcmp(argv[1], "down")) {
 		auto_su(argc, argv);
-		parse_options(&iface, &config, &mtu, &addrs, &dnses, &excluded_applications, &included_applications, argv[2]);
-		cmd_down(iface);
+		parse_options(&iface, &config, &mtu, &addrs, &dnses, &excluded_applications, &included_applications, &pre_up_cmds, &post_up_cmds, &pre_down_cmds, &post_down_cmds, argv[2]);
+		cmd_down(iface, pre_down_cmds, post_down_cmds);
 	} else {
 		cmd_usage(argv[0]);
 		return 1;
